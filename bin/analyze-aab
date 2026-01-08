@@ -1,0 +1,621 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Extract and analyze Android App Bundle (AAB) files
+set -euo pipefail
+
+# === CONFIG ===
+
+readonly VERSION="0.1.0"
+
+readonly REPORT_FORMAT_VERSION=1
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUNDLETOOL_JAR=""
+readonly COMPARE_REPORTS="$SCRIPT_DIR/compare-reports"
+readonly REFERENCE_DEVICES_DIR="$SCRIPT_DIR/../devices"
+
+show_help() {
+    echo "Usage: $(basename "$0") [options] [path]"
+    echo
+    echo "Extract and analyze Android App Bundle (AAB) files."
+    echo
+    echo "Modes:"
+    echo "  No arguments        Process all .aab files in current directory"
+    echo "  Directory path      Process all .aab files in specified directory"
+    echo "  AAB file path       Process specified .aab file"
+    echo
+    echo "Signing Options (required):"
+    echo "  --ks PATH                      Path to keystore file"
+    echo "  --ks-key-alias ALIAS           Key alias within keystore"
+    echo "  --ks-pass PASSWORD             Keystore password (or file:/path)"
+    echo "  --key-pass PASSWORD            Key password (or file:/path)"
+    echo
+    echo "Options:"
+    echo "  -s, --size-report FILE         Output file for size report (single AAB only)"
+    echo "  -c, --comparison-report FILE   Output file for comparison report (multiple AABs)"
+    echo "  -S, --sort size|diff           Sort method for comparison report (default: diff)"
+    echo "  -b, --bundletool PATH          Path to bundletool JAR file"
+    echo "  -h, --help                     Show this help message"
+    echo "  -v, --version                  Show version number"
+    echo
+    echo "Bundletool is auto-downloaded if not found (checked in order: --bundletool flag,"
+    echo "cache directory, PATH)."
+    echo
+    echo "Comparison report is automatically generated when multiple .aab are processed."
+    echo
+    echo "Examples:"
+    echo "  $(basename "$0") --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret ./my-app.aab"
+    echo "  $(basename "$0") --ks app.keystore --ks-key-alias mykey --ks-pass file:/path/pass.txt --key-pass secret ./aabs"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    show_help
+    exit 0
+fi
+
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+    echo "$(basename "$0") $VERSION"
+    exit 0
+fi
+
+# === HELPER FUNCTIONS ===
+
+get_java_version() {
+    local version_output
+    if ! version_output=$(java -version 2>&1); then
+        echo "0"
+        return
+    fi
+
+    local version
+    version=$(echo "$version_output" | head -1 | sed -n 's/.*version "\([^"]*\)".*/\1/p')
+
+    if [[ "$version" == 1.* ]]; then
+        echo "$version" | cut -d'.' -f2
+    else
+        echo "$version" | cut -d'.' -f1
+    fi
+}
+
+get_cache_dir() {
+    local cache_dir
+    case "$(uname -s)" in
+        Darwin)
+            cache_dir="$HOME/Library/Caches/analyze-aab"
+            ;;
+        *)
+            cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/analyze-aab"
+            ;;
+    esac
+    echo "$cache_dir"
+}
+
+find_bundletool() {
+    local cache_dir jar
+    cache_dir=$(get_cache_dir)
+
+    jar=$(find "$cache_dir" -maxdepth 1 -name 'bundletool*.jar' -type f 2>/dev/null | sort | head -1)
+    if [[ -n "$jar" ]]; then
+        echo "$jar"
+        return 0
+    fi
+
+    if command -v bundletool &>/dev/null; then
+        echo "bundletool"
+        return 0
+    fi
+
+    return 1
+}
+
+download_bundletool() {
+    local version="1.15.1"
+    local cache_dir dest url
+    cache_dir=$(get_cache_dir)
+    dest="$cache_dir/bundletool.jar"
+    url="https://github.com/google/bundletool/releases/download/${version}/bundletool-all-${version}.jar"
+
+    mkdir -p "$cache_dir"
+    echo "bundletool not found. Downloading v${version}..."
+    if curl -fsSL -o "$dest" "$url"; then
+        echo "Downloaded to: $dest"
+        return 0
+    else
+        echo "Error: Failed to download bundletool" >&2
+        return 1
+    fi
+}
+
+get_unique_dir() {
+    local base_name="$1"
+
+    if [[ ! -d "$base_name" ]]; then
+        echo "$base_name"
+        return
+    fi
+
+    local index=1
+    while [[ -d "${base_name}_${index}" ]]; do
+        ((index++))
+    done
+
+    echo "${base_name}_${index}"
+}
+
+format_size_mb() {
+    local bytes="$1"
+    printf "%.2f" "$(echo "$bytes / 1000000" | bc -l)"
+}
+
+get_dir_size_bytes() {
+    local dir="$1"
+    local size_kb
+    size_kb=$(du -sk "$dir" | cut -f1)
+    echo $((size_kb * 1024))
+}
+
+get_device_apk_size() {
+    local apks_file="$1"
+    local device_spec="$2"
+    local size_bytes
+
+    size_bytes=$(java -jar "$BUNDLETOOL_JAR" get-size total \
+        --apks="$apks_file" \
+        --device-spec="$device_spec" 2>/dev/null | tail -1 | cut -d',' -f2)
+
+    size_bytes="${size_bytes//[[:space:]]/}"
+
+    case "$size_bytes" in
+        ''|*[!0-9]*)
+            echo "0"
+            ;;
+        *)
+            echo "$size_bytes"
+            ;;
+    esac
+}
+
+# === REPORT GENERATION ===
+
+generate_size_report() {
+    local splits_dir="$1"
+    local report_file="$2"
+    local aab_name="$3"
+    local apks_file="$4"
+
+    {
+        echo "# AAB Size Report"
+        echo
+        echo "Version: $REPORT_FORMAT_VERSION"
+        echo
+        echo "## Application"
+        echo
+        echo "$aab_name"
+
+        local device_specs_found=false
+        if [[ -d "$REFERENCE_DEVICES_DIR" ]]; then
+            for device_spec in "$REFERENCE_DEVICES_DIR"/*.json; do
+                if [[ -f "$device_spec" ]]; then
+                    if [[ "$device_specs_found" == false ]]; then
+                        device_specs_found=true
+                        echo
+                        echo "## Device APKs"
+                        echo
+                    fi
+                    local device_name size_bytes size_mb
+                    device_name=$(basename "$device_spec" .json)
+                    size_bytes=$(get_device_apk_size "$apks_file" "$device_spec")
+                    size_mb=$(format_size_mb "$size_bytes")
+                    echo "- $device_name - ${size_mb} Mb"
+                fi
+            done
+        fi
+
+        echo
+        echo "## Split APKs"
+        echo
+
+        for apk in "$splits_dir"/*.apk; do
+            if [[ -f "$apk" ]]; then
+                local name size size_mb
+                name=$(basename "$apk")
+                size=$(stat -f%z "$apk")
+                size_mb=$(format_size_mb "$size")
+                echo "- $name - ${size_mb} Mb"
+            fi
+        done
+
+        echo
+        echo "## Libraries (from base-arm64_v8a)"
+        echo
+
+        local libs_dir="$splits_dir/base-arm64_v8a/lib/arm64-v8a"
+        if [[ -d "$libs_dir" ]]; then
+            local total_size total_mb
+            total_size=$(get_dir_size_bytes "$libs_dir")
+            total_mb=$(format_size_mb "$total_size")
+            echo "**Total: ${total_mb} Mb**"
+            echo
+
+            find "$libs_dir" -type f -name "*.so" -exec stat -f "%z %N" {} \; 2>/dev/null | \
+            sort -rn | while read -r size filepath; do
+                local name size_mb
+                name=$(basename "$filepath")
+                size_mb=$(format_size_mb "$size")
+                if [[ "$size_mb" != "0.00" ]]; then
+                    echo "- $name - ${size_mb} Mb"
+                fi
+            done
+        fi
+
+        echo
+        echo "## Sound Banks (from base-master)"
+        echo
+
+        local banks_dir="$splits_dir/base-master/assets"
+        if [[ -d "$banks_dir" ]]; then
+            local total_size=0
+            while read -r size _; do
+                total_size=$((total_size + size))
+            done < <(find "$banks_dir" -maxdepth 1 -type f -name "*.bank" -exec stat -f "%z %N" {} \; 2>/dev/null)
+            local total_mb
+            total_mb=$(format_size_mb "$total_size")
+            echo "**Total: ${total_mb} Mb**"
+            echo
+
+            find "$banks_dir" -maxdepth 1 -type f -name "*.bank" -exec stat -f "%z %N" {} \; 2>/dev/null | \
+            sort -rn | while read -r size filepath; do
+                local name size_mb
+                name=$(basename "$filepath")
+                size_mb=$(format_size_mb "$size")
+                if [[ "$size_mb" != "0.00" ]]; then
+                    echo "- $name - ${size_mb} Mb"
+                fi
+            done
+        fi
+
+        echo
+        echo "## Resources (from base-master)"
+        echo
+
+        local data_unity3d="$splits_dir/base-master/assets/bin/Data/data.unity3d"
+        local unity_default="$splits_dir/base-master/assets/bin/Data/Resources/unity default resources"
+        local total_size=0
+        local resources_list=()
+
+        if [[ -f "$data_unity3d" ]]; then
+            local size
+            size=$(stat -f%z "$data_unity3d")
+            total_size=$((total_size + size))
+            resources_list+=("$size data.unity3d")
+        fi
+        if [[ -f "$unity_default" ]]; then
+            local size
+            size=$(stat -f%z "$unity_default")
+            total_size=$((total_size + size))
+            resources_list+=("$size unity default resources")
+        fi
+
+        local total_mb
+        total_mb=$(format_size_mb "$total_size")
+        echo "**Total: ${total_mb} Mb**"
+        echo
+
+        printf '%s\n' "${resources_list[@]}" | sort -rn | while read -r size name; do
+            local size_mb
+            size_mb=$(format_size_mb "$size")
+            if [[ "$size_mb" != "0.00" ]]; then
+                echo "- $name - ${size_mb} Mb"
+            fi
+        done
+
+        echo
+        echo "## Bundles (from base-master)"
+        echo
+
+        local bundles_dir="$splits_dir/base-master/assets/aa/Android"
+        if [[ -d "$bundles_dir" ]]; then
+            local total_size total_mb
+            total_size=$(get_dir_size_bytes "$bundles_dir")
+            total_mb=$(format_size_mb "$total_size")
+            echo "**Total: ${total_mb} Mb**"
+            echo
+
+            find "$bundles_dir" -type f -exec stat -f "%z %N" {} \; 2>/dev/null | \
+            sort -rn | while read -r size filepath; do
+                local name size_mb
+                name=$(basename "$filepath")
+                size_mb=$(format_size_mb "$size")
+                if [[ "$size_mb" != "0.00" ]]; then
+                    echo "- $name - ${size_mb} Mb"
+                fi
+            done
+        fi
+    } > "$report_file"
+}
+
+process_aab() {
+    local aab_path="$1"
+    local working_dir="$2"
+    local custom_report_path="${3:-}"
+
+    local aab_name output_dir output_apks splits_dir report_file
+    aab_name=$(basename "$aab_path" .aab)
+    output_dir="$working_dir/$aab_name"
+    output_apks="$output_dir/output.apks"
+
+    echo ""
+    echo "=== Processing: $aab_path ==="
+    echo "Output directory: $output_dir"
+
+    mkdir -p "$output_dir"
+
+    echo "Building APKs..."
+    if ! java -jar "$BUNDLETOOL_JAR" build-apks \
+        --bundle="$aab_path" \
+        --output="$output_apks" \
+        --ks="$KEYSTORE" \
+        --ks-key-alias="$KEY_ALIAS" \
+        --ks-pass="$KEYSTORE_PASSWORD" \
+        --key-pass="$KEY_PASSWORD" \
+        --overwrite; then
+        echo "Error: Failed to build APKs for $aab_path"
+        return 1
+    fi
+
+    echo "Extracting APKs..."
+    unzip -o "$output_apks" -d "$output_dir"
+
+    splits_dir="$output_dir/splits"
+
+    if [[ ! -d "$splits_dir" ]]; then
+        echo "Error: Splits directory not found for $aab_path"
+        return 1
+    fi
+
+    echo "Unpacking base-master.apk..."
+    if [[ -f "$splits_dir/base-master.apk" ]]; then
+        mkdir -p "$splits_dir/base-master"
+        unzip -o "$splits_dir/base-master.apk" -d "$splits_dir/base-master" > /dev/null
+    fi
+
+    echo "Unpacking base-arm64_v8a.apk..."
+    if [[ -f "$splits_dir/base-arm64_v8a.apk" ]]; then
+        mkdir -p "$splits_dir/base-arm64_v8a"
+        unzip -o "$splits_dir/base-arm64_v8a.apk" -d "$splits_dir/base-arm64_v8a" > /dev/null
+    fi
+
+    echo "Generating size report..."
+    if [[ -n "$custom_report_path" ]]; then
+        report_file="$custom_report_path"
+        mkdir -p "$(dirname "$report_file")"
+    else
+        report_file="$output_dir/aab_size_report.txt"
+    fi
+    generate_size_report "$splits_dir" "$report_file" "$aab_name" "$output_apks"
+
+    echo "Report saved to: $report_file"
+    echo "=== Done: $aab_path ==="
+
+    SIZE_REPORTS+=("$report_file")
+    return 0
+}
+
+# === MAIN ===
+
+SIZE_REPORTS=()
+AAB_FILES=()
+SIZE_REPORT_PATH=""
+COMPARISON_REPORT_PATH=""
+SORT_METHOD=""
+TARGET_PATH=""
+KEYSTORE_PATH=""
+KEY_ALIAS=""
+KEYSTORE_PASS=""
+KEY_PASS=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s|--size-report)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: $1 requires a file path argument" >&2
+                exit 1
+            fi
+            SIZE_REPORT_PATH="$2"
+            shift 2
+            ;;
+        -c|--comparison-report)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: $1 requires a file path argument" >&2
+                exit 1
+            fi
+            COMPARISON_REPORT_PATH="$2"
+            shift 2
+            ;;
+        -S|--sort)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: $1 requires a sort method argument (size|diff)" >&2
+                exit 1
+            fi
+            case "$2" in
+                size|diff) SORT_METHOD="$2" ;;
+                *)
+                    echo "Error: Invalid sort method '$2'. Use 'size' or 'diff'" >&2
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        -b|--bundletool)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: $1 requires a path argument" >&2
+                exit 1
+            fi
+            if [[ ! -f "$2" ]]; then
+                echo "Error: bundletool not found at: $2" >&2
+                exit 1
+            fi
+            BUNDLETOOL_JAR="$2"
+            shift 2
+            ;;
+        --ks)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --ks requires a path argument" >&2
+                exit 1
+            fi
+            KEYSTORE_PATH="$2"
+            shift 2
+            ;;
+        --ks-key-alias)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --ks-key-alias requires an alias argument" >&2
+                exit 1
+            fi
+            KEY_ALIAS="$2"
+            shift 2
+            ;;
+        --ks-pass)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --ks-pass requires a password argument" >&2
+                exit 1
+            fi
+            KEYSTORE_PASS="$2"
+            shift 2
+            ;;
+        --key-pass)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --key-pass requires a password argument" >&2
+                exit 1
+            fi
+            KEY_PASS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -*)
+            echo "Error: Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -n "$TARGET_PATH" ]]; then
+                echo "Error: Multiple paths specified" >&2
+                exit 1
+            fi
+            TARGET_PATH="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$KEYSTORE_PATH" ]]; then
+    echo "Error: --ks is required" >&2
+    exit 1
+fi
+if [[ -z "$KEY_ALIAS" ]]; then
+    echo "Error: --ks-key-alias is required" >&2
+    exit 1
+fi
+if [[ -z "$KEYSTORE_PASS" ]]; then
+    echo "Error: --ks-pass is required" >&2
+    exit 1
+fi
+if [[ -z "$KEY_PASS" ]]; then
+    echo "Error: --key-pass is required" >&2
+    exit 1
+fi
+
+if [[ ! -f "$KEYSTORE_PATH" ]]; then
+    echo "Error: Keystore file not found: $KEYSTORE_PATH" >&2
+    exit 1
+fi
+
+if [[ "$KEYSTORE_PASS" != file:* ]]; then
+    KEYSTORE_PASS="pass:$KEYSTORE_PASS"
+fi
+if [[ "$KEY_PASS" != file:* ]]; then
+    KEY_PASS="pass:$KEY_PASS"
+fi
+
+readonly KEYSTORE="$KEYSTORE_PATH"
+readonly KEYSTORE_PASSWORD="$KEYSTORE_PASS"
+readonly KEY_PASSWORD="$KEY_PASS"
+readonly KEY_ALIAS
+
+JAVA_VERSION=$(get_java_version)
+if [[ "$JAVA_VERSION" -eq 0 ]]; then
+    echo "Error: Java not found. Please install Java 8 or later." >&2
+    exit 1
+elif [[ "$JAVA_VERSION" -lt 8 ]]; then
+    echo "Error: Java 8+ required, found Java $JAVA_VERSION." >&2
+    exit 1
+fi
+
+if [[ -z "$BUNDLETOOL_JAR" ]]; then
+    if ! BUNDLETOOL_JAR=$(find_bundletool); then
+        download_bundletool || exit 1
+        BUNDLETOOL_JAR="$(get_cache_dir)/bundletool.jar"
+    fi
+fi
+readonly BUNDLETOOL_JAR
+
+if [[ -n "$TARGET_PATH" ]]; then
+    if [[ -d "$TARGET_PATH" ]]; then
+        TARGET_DIR="$(cd "$TARGET_PATH" && pwd)"
+    else
+        TARGET_DIR="$(cd "$(dirname "$TARGET_PATH")" && pwd)"
+
+        if [[ "$TARGET_PATH" == *.aab ]]; then
+            if [[ ! -f "$TARGET_PATH" ]]; then
+                echo "Error: File not found: $TARGET_PATH"
+                exit 1
+            fi
+            AAB_FILES+=("$TARGET_DIR/$(basename "$TARGET_PATH")")
+        fi
+    fi
+else
+    TARGET_DIR="$(pwd)"
+fi
+
+if [[ ${#AAB_FILES[@]} -eq 0 ]]; then
+    for f in "$TARGET_DIR"/*.aab; do
+        [[ -f "$f" ]] && AAB_FILES+=("$f")
+    done
+fi
+
+if [[ ${#AAB_FILES[@]} -eq 0 ]]; then
+    echo "No .aab files found in: $TARGET_DIR"
+    exit 1
+fi
+
+if [[ -n "$SIZE_REPORT_PATH" && ${#AAB_FILES[@]} -gt 1 ]]; then
+    echo "Error: --size-report is only supported for single AAB processing" >&2
+    echo "Found ${#AAB_FILES[@]} AAB files to process" >&2
+    exit 1
+fi
+
+echo "Found ${#AAB_FILES[@]} AAB file(s) to process."
+
+CONTENT_DIR=$(get_unique_dir "$TARGET_DIR/aab-content")
+mkdir -p "$CONTENT_DIR"
+echo "Output directory: $CONTENT_DIR"
+
+for aab_path in "${AAB_FILES[@]}"; do
+    process_aab "$aab_path" "$CONTENT_DIR" "$SIZE_REPORT_PATH"
+done
+
+echo ""
+echo "All AAB files processed."
+
+if [[ ${#SIZE_REPORTS[@]} -gt 1 ]]; then
+    echo ""
+    echo "=== Generating comparison report ==="
+    COMPARE_ARGS=()
+    [[ -n "$SORT_METHOD" ]] && COMPARE_ARGS+=(--sort "$SORT_METHOD")
+    if [[ -n "$COMPARISON_REPORT_PATH" ]]; then
+        "$COMPARE_REPORTS" ${COMPARE_ARGS[@]+"${COMPARE_ARGS[@]}"} --output "$COMPARISON_REPORT_PATH" "${SIZE_REPORTS[@]}"
+    else
+        COMPARISON_FILE="$CONTENT_DIR/aab_size_comparison.txt"
+        "$COMPARE_REPORTS" ${COMPARE_ARGS[@]+"${COMPARE_ARGS[@]}"} --output "$COMPARISON_FILE" "${SIZE_REPORTS[@]}"
+    fi
+fi

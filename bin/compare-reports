@@ -1,0 +1,650 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Compare AAB size reports and generate comparison tables
+set -euo pipefail
+
+# === CONSTANTS ===
+
+readonly VERSION="0.1.0"
+readonly NAME_COL_WIDTH=40
+readonly SORT_BY_SIZE="size"
+readonly SORT_BY_DIFF="diff"
+
+# === HELPER FUNCTIONS ===
+
+# Check if a value is a valid numeric size (e.g., "1.23" or "0.05")
+is_numeric_size() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+}
+
+# Calculate delta between two sizes and format for display
+# Returns: formatted delta string (e.g., "(+1.50 Mb)") or empty if no change/invalid
+format_delta() {
+    local current="$1"
+    local previous="$2"
+
+    if ! is_numeric_size "$current" || ! is_numeric_size "$previous"; then
+        return
+    fi
+
+    local diff
+    diff=$(echo "$current - $previous" | bc -l)
+
+    local abs_diff
+    abs_diff=$(echo "if ($diff < 0) -1 * $diff else $diff" | bc -l)
+
+    if [[ $(echo "$abs_diff < 0.005" | bc -l) == "1" ]]; then
+        return
+    fi
+
+    local formatted
+    if [[ $(echo "$diff > 0" | bc -l) == "1" ]]; then
+        formatted=$(printf "+%.2f Mb" "$diff")
+    else
+        formatted=$(printf "%.2f Mb" "$diff")
+    fi
+
+    echo "($formatted)"
+}
+
+is_size_report() {
+    local file="$1"
+    local first_line
+    if [[ -r "$file" ]] && read -r first_line < "$file"; then
+        [[ "$first_line" == "# AAB Size Report" ]]
+    else
+        return 1
+    fi
+}
+
+get_report_version() {
+    local report_file="$1"
+    local line
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Version:\ ([0-9]+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+        if [[ "$line" =~ ^##\  ]]; then
+            break
+        fi
+    done < "$report_file"
+
+    echo "0"
+}
+
+validate_report_versions() {
+    local reports=("$@")
+    local first_version
+    first_version=$(get_report_version "${reports[0]}")
+
+    for report in "${reports[@]:1}"; do
+        local version
+        version=$(get_report_version "$report")
+        if [[ "$version" != "$first_version" ]]; then
+            echo "Error: Report version mismatch" >&2
+            echo "  $(basename "${reports[0]}"): version $first_version" >&2
+            echo "  $(basename "$report"): version $version" >&2
+            echo "Hint: Regenerate reports using the same version of analyze-aab.sh" >&2
+            return 1
+        fi
+    done
+}
+
+get_application_name() {
+    local report_file="$1"
+    local in_app_section=false
+    local line
+
+    while IFS= read -r line; do
+        if [[ "$line" == "## Application" ]]; then
+            in_app_section=true
+            continue
+        fi
+        # Stop if we hit another section while in Application section
+        if [[ "$in_app_section" == true && "$line" =~ ^##[[:space:]] ]]; then
+            break
+        fi
+        if [[ "$in_app_section" == true ]]; then
+            if [[ -z "$line" ]]; then
+                continue
+            fi
+            echo "$line"
+            return 0
+        fi
+    done < "$report_file"
+
+    echo "Unknown"
+}
+
+# Strip MD5 hash suffix from filenames
+# Usage: strip_hash_suffix <name>
+# Returns: name with hash suffix removed
+strip_hash_suffix() {
+    local name="$1"
+    echo "$name" | sed -E 's/_[a-f0-9]{32}(\.[^.]+)$/\1/'
+}
+
+trim_name() {
+    local name="$1"
+    local max_length="$2"
+    local trim_length=$((max_length - 3))
+
+    if [[ ${#name} -gt $max_length ]]; then
+        echo "${name:0:$trim_length}..."
+    else
+        echo "$name"
+    fi
+}
+
+# === REPORT PARSING ===
+
+# Parse a size report file into temp files (generic, section-agnostic)
+# Usage: parse_size_report <report_file> <output_dir>
+# Creates files dynamically based on discovered sections:
+#   - sections.txt: ordered list of section headers
+#   - section_<index>_items.txt: items for each section (name\tsize_mb)
+#   - section_<index>_total.txt: total for each section (if present)
+parse_size_report() {
+    local report_file="$1"
+    local output_dir="$2"
+    local current_section_index=-1
+    local line name size_mb
+
+    mkdir -p "$output_dir"
+    > "$output_dir/sections.txt"
+
+    while IFS= read -r line; do
+        # Detect section headers (## heading)
+        if [[ "$line" =~ ^##\ (.+)$ ]]; then
+            local section_header="${BASH_REMATCH[1]}"
+            # Skip Application section - it's metadata, not content
+            if [[ "$section_header" == "Application" ]]; then
+                continue
+            fi
+            ((current_section_index++))
+            echo "$section_header" >> "$output_dir/sections.txt"
+            > "$output_dir/section_${current_section_index}_items.txt"
+            > "$output_dir/section_${current_section_index}_total.txt"
+            continue
+        fi
+
+        # Skip if no section detected yet
+        if [[ $current_section_index -lt 0 ]]; then
+            continue
+        fi
+
+        # Parse total lines (e.g., "**Total: 146.55 Mb**")
+        if [[ "$line" =~ ^\*\*Total:\ ([0-9.]+)\ Mb\*\*$ ]]; then
+            size_mb="${BASH_REMATCH[1]}"
+            echo "$size_mb" > "$output_dir/section_${current_section_index}_total.txt"
+            continue
+        fi
+
+        # Parse item lines (e.g., "- libil2cpp.so - 112.68 Mb")
+        if [[ "$line" =~ ^-\ (.+)\ -\ ([0-9.]+)\ Mb$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            size_mb="${BASH_REMATCH[2]}"
+
+            # Normalize names by stripping hash suffix (MD5)
+            name=$(strip_hash_suffix "$name")
+
+            printf '%s\t%s\n' "$name" "$size_mb" >> "$output_dir/section_${current_section_index}_items.txt"
+        fi
+    done < "$report_file"
+}
+
+lookup_value() {
+    local file="$1"
+    local key="$2"
+    while IFS=$'\t' read -r name value; do
+        if [[ "$name" == "$key" ]]; then
+            echo "$value"
+            return 0
+        fi
+    done < <(grep -F "	" "$file" 2>/dev/null)
+}
+
+get_section_index() {
+    local parsed_dir="$1"
+    local section_header="$2"
+    local index=0
+
+    while IFS= read -r header; do
+        if [[ "$header" == "$section_header" ]]; then
+            echo "$index"
+            return 0
+        fi
+        ((index++))
+    done < "$parsed_dir/sections.txt"
+}
+
+# === COMPARISON REPORT GENERATION ===
+
+generate_comparison_report() {
+    local report_file="$1"
+    local sort_method="$2"
+    shift 2
+    local size_reports=("$@")
+
+    if [[ ${#size_reports[@]} -eq 0 ]]; then
+        echo "Error: No size reports to compare." >&2
+        return 1
+    fi
+
+    local aab_names=()
+    local parsed_dirs=()
+    local tmp_base
+    tmp_base=$(mktemp -d)
+
+    # Create temporary array to hold app_name and report pairs
+    local name_report_pairs=()
+
+    for report in "${size_reports[@]}"; do
+        local app_name
+        app_name=$(get_application_name "$report")
+        name_report_pairs+=("$app_name"$'\t'"$report")
+    done
+
+    # Sort by application name alphabetically
+    local sorted_pairs
+    sorted_pairs=$(printf '%s\n' "${name_report_pairs[@]}" | sort -t$'\t' -k1)
+
+    # Rebuild size_reports array in sorted order
+    local sorted_size_reports=()
+    while IFS=$'\t' read -r app_name report; do
+        aab_names+=("$app_name")
+        sorted_size_reports+=("$report")
+    done <<< "$sorted_pairs"
+
+    # Update size_reports to reflect sorted order
+    size_reports=("${sorted_size_reports[@]}")
+
+    # Calculate column width based on AAB names
+    local col_width=15
+    for name in "${aab_names[@]}"; do
+        local len=${#name}
+        if [[ $((len + 2)) -gt $col_width ]]; then
+            col_width=$((len + 2))
+        fi
+    done
+
+    # Parse all size reports
+    local i
+    for ((i=0; i<${#size_reports[@]}; i++)); do
+        local parsed_dir="$tmp_base/report_$i"
+        parse_size_report "${size_reports[$i]}" "$parsed_dir"
+        parsed_dirs+=("$parsed_dir")
+    done
+
+    # Collect all unique section headers across all reports (preserving order from first occurrence)
+    local all_sections=()
+    local seen_sections=""
+    for ((i=0; i<${#size_reports[@]}; i++)); do
+        local parsed_dir="${parsed_dirs[$i]}"
+        while IFS= read -r section_header; do
+            if [[ -n "$section_header" && ! "$seen_sections" =~ "|${section_header}|" ]]; then
+                all_sections+=("$section_header")
+                seen_sections="${seen_sections}|${section_header}|"
+            fi
+        done < "$parsed_dir/sections.txt"
+    done
+
+    {
+        echo "# AAB Size Comparison Report"
+        echo ""
+
+        local is_first_section=true
+        for section_header in "${all_sections[@]}"; do
+            if [[ "$is_first_section" == true ]]; then
+                is_first_section=false
+            else
+                echo
+            fi
+
+            local name_col_width="$NAME_COL_WIDTH"
+
+            printf "| %-${name_col_width}s |" "$section_header"
+            for name in "${aab_names[@]}"; do
+                printf " %-${col_width}s |" "$name"
+            done
+            echo
+
+            # Print separator
+            printf "|%-$((name_col_width + 2))s|" "$(printf '%0.s-' $(seq 1 $((name_col_width + 2))))"
+            for _ in "${aab_names[@]}"; do
+                printf "%-$((col_width + 2))s|" "$(printf '%0.s-' $(seq 1 $((col_width + 2))))"
+            done
+            echo
+
+            # Check if any report has a total for this section
+            local has_total=false
+            for ((i=0; i<${#size_reports[@]}; i++)); do
+                local parsed_dir="${parsed_dirs[$i]}"
+                local section_index
+                section_index=$(get_section_index "$parsed_dir" "$section_header")
+                if [[ -n "$section_index" ]]; then
+                    local total_file="$parsed_dir/section_${section_index}_total.txt"
+                    if [[ -s "$total_file" ]]; then
+                        has_total=true
+                        break
+                    fi
+                fi
+            done
+
+            # Print total row if any report has totals
+            if [[ "$has_total" == true ]]; then
+                printf "| %-${name_col_width}s |" "**Total**"
+                local prev_total=""
+                for ((i=0; i<${#size_reports[@]}; i++)); do
+                    local parsed_dir="${parsed_dirs[$i]}"
+                    local section_index
+                    section_index=$(get_section_index "$parsed_dir" "$section_header")
+                    local total=""
+                    if [[ -n "$section_index" ]]; then
+                        total=$(cat "$parsed_dir/section_${section_index}_total.txt" 2>/dev/null)
+                    fi
+                    if [[ -n "$total" ]]; then
+                        local delta=""
+                        if [[ $i -gt 0 && -n "$prev_total" ]]; then
+                            delta=$(format_delta "$total" "$prev_total")
+                        fi
+                        if [[ -n "$delta" ]]; then
+                            printf " %-${col_width}s |" "**${total} Mb** ${delta}"
+                        else
+                            printf " %-${col_width}s |" "**${total} Mb**"
+                        fi
+                        prev_total="$total"
+                    else
+                        printf " %-${col_width}s |" "-"
+                        prev_total=""
+                    fi
+                done
+                echo
+
+                # Empty row after total
+                printf "| %-${name_col_width}s |" ""
+                for _ in "${aab_names[@]}"; do
+                    printf " %-${col_width}s |" ""
+                done
+                echo
+            fi
+
+            # Collect all items with sizes in single pass, then aggregate with awk
+            local tmp_raw tmp_items
+            tmp_raw=$(mktemp)
+            tmp_items=$(mktemp)
+            local last_idx=$((${#size_reports[@]} - 1))
+            local prev_idx=$((last_idx - 1))
+
+            # Pass 1: Collect all items with their sizes and report indices
+            for ((i=0; i<${#size_reports[@]}; i++)); do
+                local parsed_dir="${parsed_dirs[$i]}"
+                local section_index
+                section_index=$(get_section_index "$parsed_dir" "$section_header")
+                if [[ -n "$section_index" ]]; then
+                    local items_file="$parsed_dir/section_${section_index}_items.txt"
+                    if [[ -f "$items_file" ]]; then
+                        while IFS=$'\t' read -r name size_mb; do
+                            [[ -z "$name" ]] && continue
+                            printf '%s\t%s\t%s\n' "$name" "$size_mb" "$i" >> "$tmp_raw"
+                        done < "$items_file"
+                    fi
+                fi
+            done
+
+            # Compute sort metrics: priority (2=increased, 1=decreased, 0=unchanged), max size, abs diff
+            awk -F'\t' -v last_idx="$last_idx" -v prev_idx="$prev_idx" '
+            {
+                name = $1; size = $2 + 0; idx = $3 + 0
+                if (size > max[name]) max[name] = size
+                sizes[name, idx] = size
+                seen[name] = 1
+            }
+            END {
+                for (name in seen) {
+                    last = sizes[name, last_idx] + 0
+                    prev = sizes[name, prev_idx] + 0
+                    diff = last - prev
+                    if (diff > 0) priority = 2
+                    else if (diff < 0) priority = 1
+                    else priority = 0
+                    abs_diff = (diff < 0) ? -diff : diff
+                    printf "%d %.6f %.6f %s\n", priority, max[name], abs_diff, name
+                }
+            }
+            ' "$tmp_raw" > "$tmp_items"
+            rm -f "$tmp_raw"
+
+            # Sort items based on method: size (size desc, diff_priority desc, abs_diff desc)
+            #                          or diff (diff_priority desc, abs_diff desc, size desc)
+            local sorted_items=()
+            local sort_keys=()
+            if [[ "$sort_method" == "$SORT_BY_DIFF" ]]; then
+                sort_keys=(-k1,1rn -k3,3rg -k2,2rg)
+            else
+                sort_keys=(-k2,2rg -k1,1rn -k3,3rg)
+            fi
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local item_name
+                item_name="${line#* * * }"
+                sorted_items+=("$item_name")
+            done < <(sort -t' ' "${sort_keys[@]}" "$tmp_items" 2>/dev/null)
+
+            # Print each item row
+            for item in "${sorted_items[@]+"${sorted_items[@]}"}"; do
+                [[ -z "$item" ]] && continue
+                local display_name
+                display_name=$(trim_name "$item" "$name_col_width")
+                printf "| %-${name_col_width}s |" "$display_name"
+                local prev_size=""
+                for ((i=0; i<${#size_reports[@]}; i++)); do
+                    local parsed_dir="${parsed_dirs[$i]}"
+                    local section_index
+                    section_index=$(get_section_index "$parsed_dir" "$section_header")
+                    local size_mb=""
+                    if [[ -n "$section_index" ]]; then
+                        size_mb=$(lookup_value "$parsed_dir/section_${section_index}_items.txt" "$item")
+                    fi
+                    if [[ -n "$size_mb" ]]; then
+                        local delta=""
+                        if [[ $i -gt 0 && -n "$prev_size" ]]; then
+                            delta=$(format_delta "$size_mb" "$prev_size")
+                        fi
+                        if [[ -n "$delta" ]]; then
+                            printf " %-${col_width}s |" "${size_mb} Mb ${delta}"
+                        else
+                            printf " %-${col_width}s |" "${size_mb} Mb"
+                        fi
+                        prev_size="$size_mb"
+                    else
+                        printf " %-${col_width}s |" "-"
+                        prev_size=""
+                    fi
+                done
+                echo
+            done
+
+            rm -f "$tmp_items"
+        done
+
+    } > "$report_file"
+
+    rm -rf "$tmp_base"
+}
+
+# === MAIN ===
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    echo "Usage: $(basename "$0") [options] [paths]"
+    echo
+    echo "Compare AAB size reports and generate a comparison table."
+    echo
+    echo "Modes:"
+    echo "  No arguments        Scan current directory for size reports"
+    echo "  Directory path      Scan specified directory for size reports"
+    echo "  Report files        Compare specified report files directly"
+    echo
+    echo "Options:"
+    echo "  -o, --output FILE      Output file (default: size-comparison.txt in current directory)"
+    echo "  -S, --sort size|diff   Sort method (default: diff)"
+    echo "  -h, --help             Show this help message"
+    echo "  -v, --version          Show version number"
+    echo
+    echo "Examples:"
+    echo "  $(basename "$0")                                       # scan current directory"
+    echo "  $(basename "$0") ./reports-directory                   # scan specific directory"
+    echo "  $(basename "$0") size1.txt size2.txt                   # compare specific reports"
+    echo "  $(basename "$0") --sort diff size1.txt size2.txt       # sort by diff"
+    echo "  $(basename "$0") --output cmp.txt size1.txt size2.txt  # custom output path"
+}
+
+scan_directory_for_reports() {
+    local dir="$1"
+    local file
+
+    while IFS= read -r -d '' file; do
+        if is_size_report "$file"; then
+            REPORTS+=("$file")
+        fi
+    done < <(find "$dir" -maxdepth 1 -type f -name "*.txt" -print0 2>/dev/null)
+}
+
+get_unique_output_file() {
+    local output_file="$1"
+
+    if [[ "$OUTPUT_FILE_EXPLICIT" != "true" ]] && [[ -f "$output_file" ]]; then
+        local base="${output_file%.*}"
+        local ext="${output_file##*.}"
+        local index=1
+
+        while [[ -f "${base}_${index}.${ext}" ]]; do
+            ((index++))
+        done
+
+        echo "${base}_${index}.${ext}"
+    else
+        echo "$output_file"
+    fi
+}
+
+OUTPUT_FILE=""
+OUTPUT_FILE_EXPLICIT=false
+SORT_METHOD="$SORT_BY_DIFF"
+REPORTS=()
+SCAN_DIR=""
+REPORTS_DIR=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--output)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: $1 requires an output file argument" >&2
+                exit 1
+            fi
+            OUTPUT_FILE="$2"
+            OUTPUT_FILE_EXPLICIT=true
+            shift 2
+            ;;
+        -S|--sort)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: $1 requires a sort method argument (size|diff)" >&2
+                exit 1
+            fi
+            case "$2" in
+                size) SORT_METHOD="$SORT_BY_SIZE" ;;
+                diff) SORT_METHOD="$SORT_BY_DIFF" ;;
+                *)
+                    echo "Error: Invalid sort method '$2'. Use 'size' or 'diff'" >&2
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "$(basename "$0") $VERSION"
+            exit 0
+            ;;
+        -*)
+            echo "Error: Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+        *)
+            if [[ -d "$1" ]]; then
+                if [[ -n "$SCAN_DIR" ]]; then
+                    echo "Error: Multiple directories specified. Use either a directory or report files, not both." >&2
+                    exit 1
+                fi
+                if [[ ${#REPORTS[@]} -gt 0 ]]; then
+                    echo "Error: Cannot mix directory and file arguments." >&2
+                    exit 1
+                fi
+                SCAN_DIR="$1"
+            elif [[ -f "$1" ]]; then
+                if [[ -n "$SCAN_DIR" ]]; then
+                    echo "Error: Cannot mix directory and file arguments." >&2
+                    exit 1
+                fi
+                REPORTS+=("$1")
+            else
+                echo "Error: Path not found: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Determine mode and collect reports
+if [[ -n "$SCAN_DIR" ]]; then
+    scan_directory_for_reports "$SCAN_DIR"
+    if [[ ${#REPORTS[@]} -eq 0 ]]; then
+        echo "Error: No valid size reports found in: $SCAN_DIR" >&2
+        exit 1
+    fi
+    echo "Found ${#REPORTS[@]} size report(s) in: $SCAN_DIR"
+    REPORTS_DIR="$SCAN_DIR"
+elif [[ ${#REPORTS[@]} -eq 0 ]]; then
+    default_scan_dir="$(pwd)"
+    scan_directory_for_reports "$default_scan_dir"
+    if [[ ${#REPORTS[@]} -eq 0 ]]; then
+        echo "Error: No valid size reports found in current directory: $default_scan_dir" >&2
+        exit 1
+    fi
+    echo "Found ${#REPORTS[@]} size report(s) in current directory"
+    REPORTS_DIR="$default_scan_dir"
+else
+    # Specific report files were provided - use directory of first report
+    REPORTS_DIR="$(dirname "${REPORTS[0]}")"
+fi
+
+if [[ ${#REPORTS[@]} -lt 2 ]]; then
+    echo "Error: At least 2 report files are required for comparison" >&2
+    echo "Found reports:"
+    for r in "${REPORTS[@]+"${REPORTS[@]}"}"; do
+        echo "  - $r"
+    done
+    exit 1
+fi
+
+if [[ -z "$OUTPUT_FILE" ]]; then
+    # Default: use size-comparison.txt in the reports directory
+    OUTPUT_FILE="$REPORTS_DIR/size-comparison.txt"
+    # Check if file exists and get unique name
+    OUTPUT_FILE=$(get_unique_output_file "$OUTPUT_FILE")
+fi
+
+validate_report_versions "${REPORTS[@]}"
+
+generate_comparison_report "$OUTPUT_FILE" "$SORT_METHOD" "${REPORTS[@]}"
+echo "Comparison report saved to: $OUTPUT_FILE"
