@@ -11,7 +11,6 @@ readonly REPORT_FORMAT_VERSION=1
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLETOOL_JAR=""
 readonly COMPARE_REPORTS="$SCRIPT_DIR/compare-reports"
-readonly REFERENCE_DEVICES_DIR="$SCRIPT_DIR/../devices"
 
 show_help() {
     echo "Usage: $(basename "$0") [options] [path]"
@@ -88,6 +87,40 @@ get_cache_dir() {
     esac
     echo "$cache_dir"
 }
+
+get_data_dir() {
+    local data_dir
+    case "$(uname -s)" in
+        Darwin)
+            data_dir="$HOME/Library/Application Support/analyze-aab"
+            ;;
+        *)
+            data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/analyze-aab"
+            ;;
+    esac
+    echo "$data_dir"
+}
+
+get_devices_dir() {
+    local data_dir
+    # 1. Check relative to script (development/git clone)
+    if [[ -d "$SCRIPT_DIR/../devices" ]]; then
+        echo "$SCRIPT_DIR/../devices"
+        return
+    fi
+    # 2. Check platform-specific data directory (installed via install.sh)
+    data_dir="$(get_data_dir)/devices"
+    if [[ -d "$data_dir" ]]; then
+        echo "$data_dir"
+        return
+    fi
+    # 3. Fallback - create empty dir in cache
+    data_dir="$(get_cache_dir)/devices"
+    mkdir -p "$data_dir"
+    echo "$data_dir"
+}
+
+readonly REFERENCE_DEVICES_DIR="$(get_devices_dir)"
 
 find_bundletool() {
     local cache_dir jar

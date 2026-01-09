@@ -39,22 +39,40 @@ This toolkit consists of two scripts:
 
 ## Installation
 
-Clone the repository:
+### Requirements
+
+This toolkit requires macOS and Java 8.
+
+Analyze-aab uses bundletool to extract APKs from an AAB. It looks for bundletool in the PATH and, if not found, automatically downloads it on the first run. You may also specify bundletool path using the --bundletool option.
+
+### Quick Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GallopingDino/analyze-aab/main/install.sh | bash
+```
+
+This installs to `~/.local/bin`. If that's not in your PATH, the script will show you how to add it.
+
+### Manual Install
+
+Clone the repository and add `bin/` to your PATH:
 
 ```bash
 git clone https://github.com/GallopingDino/analyze-aab.git
 ```
 
-**Requirements:** macOS, Java 8
+### Uninstall
 
-**Bundletool:** uses bundletool from PATH if available, otherwise auto-downloads on first run. You can also specify path to the bundletool via `--bundletool` option.
+```bash
+curl -fsSL https://raw.githubusercontent.com/GallopingDino/analyze-aab/main/install.sh | bash -s uninstall
+```
 
 ## Usage
 
 ### analyze-aab
 
 ```bash
-bin/analyze-aab [options] [path]
+analyze-aab [options] [path]
 ```
 
 #### Modes
@@ -84,25 +102,25 @@ The script requires signing credentials to build APKs from AABs. All four flags 
 
 ```bash
 # Basic usage with signing credentials
-bin/analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret ./my-app.aab
+analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret ./my-app.aab
 
 # Using password file for secure credential storage
-bin/analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass file:/path/ks.txt --key-pass file:/path/key.txt ./my-app.aab
+analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass file:/path/ks.txt --key-pass file:/path/key.txt ./my-app.aab
 
 # Process all AABs in a directory
-bin/analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret ./aab-directory
+analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret ./aab-directory
 
 # Custom size report path
-bin/analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret --size-report size.txt ./my-app.aab
+analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret --size-report size.txt ./my-app.aab
 
 # Custom comparison report and sort method
-bin/analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret --comparison-report cmp.txt --sort diff ./aabs
+analyze-aab --ks app.keystore --ks-key-alias mykey --ks-pass secret --key-pass secret --comparison-report cmp.txt --sort diff ./aabs
 ```
 
 ### compare-reports
 
 ```bash
-bin/compare-reports [options] [paths]
+compare-reports [options] [paths]
 ```
 
 #### Modes
@@ -120,11 +138,11 @@ bin/compare-reports [options] [paths]
 #### Examples
 
 ```bash
-bin/compare-reports                                       # scan current directory
-bin/compare-reports ./reports-directory                   # scan specific directory
-bin/compare-reports size1.txt size2.txt                   # compare specific reports
-bin/compare-reports --sort diff size1.txt size2.txt       # sort by diff
-bin/compare-reports --output cmp.txt size1.txt size2.txt  # custom output path
+compare-reports                                       # scan current directory
+compare-reports ./reports-directory                   # scan specific directory
+compare-reports size1.txt size2.txt                   # compare specific reports
+compare-reports --sort diff size1.txt size2.txt       # sort by diff
+compare-reports --output cmp.txt size1.txt size2.txt  # custom output path
 ```
 
 ## Reference Devices
